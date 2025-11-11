@@ -1,18 +1,42 @@
-from opensky_api import OpenSkyApi
+import requests
 from config import Config
-from utils import calculate_bounding_box, format_aircraft_state, haversine_distance, iso_to_unix
+from utils import calculate_bounding_box, haversine_distance, iso_to_unix
 import time
 
 class OpenSkyService:
     def __init__(self):
         """Initialize OpenSky API client"""
+        self.base_url = "https://opensky-network.org/api"
+        self.auth = None
         if Config.OPENSKY_USERNAME and Config.OPENSKY_PASSWORD:
-            self.api = OpenSkyApi(
-                username=Config.OPENSKY_USERNAME,
-                password=Config.OPENSKY_PASSWORD
-            )
-        else:
-            self.api = OpenSkyApi()  # Anonymous access
+            self.auth = (Config.OPENSKY_USERNAME, Config.OPENSKY_PASSWORD)
+    
+    def _format_state_vector(self, state):
+        """Format state vector from OpenSky API response"""
+        if not state or len(state) < 17:
+            return None
+        
+        return {
+            'icao24': state[0],
+            'callsign': state[1].strip() if state[1] else None,
+            'origin_country': state[2],
+            'time_position': state[3],
+            'last_contact': state[4],
+            'longitude': state[5],
+            'latitude': state[6],
+            'baro_altitude': state[7],  # meters
+            'on_ground': state[8],
+            'velocity': state[9],  # m/s
+            'true_track': state[10],  # degrees
+            'vertical_rate': state[11],  # m/s
+            'sensors': state[12],
+            'geo_altitude': state[13],
+            'squawk': state[14],
+            'spi': state[15],
+            'position_source': state[16],
+            'altitude_feet': round(state[7] / Config.FEET_TO_METERS) if state[7] else None,
+            'velocity_knots': round(state[9] / Config.KNOTS_TO_MS) if state[9] else None
+        }
     
     def collect_adsb_data(self, latitude, longitude, radius, altitude_min=None, 
                          altitude_max=None, aircraft_type=None):
@@ -34,10 +58,24 @@ class OpenSkyService:
             # Calculate bounding box
             bbox = calculate_bounding_box(latitude, longitude, radius)
             
-            # Get states from OpenSky
-            states = self.api.get_states(bbox=bbox)
+            # Call OpenSky API
+            params = {
+                'lamin': bbox[0],
+                'lamax': bbox[1],
+                'lomin': bbox[2],
+                'lomax': bbox[3]
+            }
             
-            if not states:
+            response = requests.get(
+                f"{self.base_url}/states/all",
+                params=params,
+                auth=self.auth,
+                timeout=Config.REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if not data or not data.get('states'):
                 return {
                     'success': True,
                     'aircraft_count': 0,
@@ -50,8 +88,10 @@ class OpenSkyService:
             
             # Format and filter aircraft
             aircraft = []
-            for state in states.states:
-                formatted = format_aircraft_state(state)
+            for state in data['states']:
+                formatted = self._format_state_vector(state)
+                if not formatted:
+                    continue
                 
                 # Apply altitude filters
                 if altitude_min and formatted['altitude_feet']:
@@ -62,7 +102,7 @@ class OpenSkyService:
                     if formatted['altitude_feet'] > altitude_max:
                         continue
                 
-                # Apply aircraft type filter (matches against ICAO24 or callsign)
+                # Apply aircraft type filter
                 if aircraft_type:
                     if aircraft_type.lower() not in (formatted['icao24'].lower() if formatted['icao24'] else ''):
                         if aircraft_type.upper() not in (formatted['callsign'] or ''):
@@ -80,7 +120,7 @@ class OpenSkyService:
             
             return {
                 'success': True,
-                'timestamp': int(time.time()),
+                'timestamp': data.get('time', int(time.time())),
                 'aircraft_count': len(aircraft),
                 'aircraft': aircraft,
                 'search_area': {
@@ -117,29 +157,26 @@ class OpenSkyService:
         try:
             icao24 = identifier.lower() if identifier_type == 'icao24' else None
             
-            # Get current state for this aircraft
-            states = self.api.get_states(icao24=icao24)
+            params = {'icao24': icao24} if icao24 else {}
             
-            if not states or not states.states:
+            response = requests.get(
+                f"{self.base_url}/states/all",
+                params=params,
+                auth=self.auth,
+                timeout=Config.REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+            data = response.json()
+            
+            if not data or not data.get('states'):
                 return {
                     'success': False,
                     'error': 'Aircraft not found or not currently transmitting',
                     'identifier': identifier
                 }
             
-            # Get the first matching state
-            state = states.states[0]
-            formatted = format_aircraft_state(state)
-            
-            # Try to get recent flight history
-            end_time = int(time.time())
-            begin_time = end_time - (24 * 3600)  # Last 24 hours
-            
-            try:
-                flights = self.api.get_flights_by_aircraft(icao24, begin_time, end_time)
-                formatted['recent_flights'] = len(flights) if flights else 0
-            except:
-                formatted['recent_flights'] = None
+            state = data['states'][0]
+            formatted = self._format_state_vector(state)
             
             return {
                 'success': True,
@@ -176,9 +213,16 @@ class OpenSkyService:
                     'error': 'Invalid time format. Use ISO 8601 (YYYY-MM-DDTHH:MM:SSZ)'
                 }
             
-            # Try to get flights
             icao24 = flight_id.lower()
-            flights = self.api.get_flights_by_aircraft(icao24, begin, end)
+            
+            response = requests.get(
+                f"{self.base_url}/flights/aircraft",
+                params={'icao24': icao24, 'begin': begin, 'end': end},
+                auth=self.auth,
+                timeout=Config.REQUEST_TIMEOUT
+            )
+            response.raise_for_status()
+            flights = response.json()
             
             if not flights:
                 return {
@@ -191,14 +235,14 @@ class OpenSkyService:
             formatted_flights = []
             for flight in flights:
                 formatted_flights.append({
-                    'icao24': flight.icao24,
-                    'callsign': flight.callsign.strip() if flight.callsign else None,
-                    'departure_airport': flight.estDepartureAirport,
-                    'arrival_airport': flight.estArrivalAirport,
-                    'first_seen': flight.firstSeen,
-                    'last_seen': flight.lastSeen,
-                    'departure_time_utc': time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(flight.firstSeen)) if flight.firstSeen else None,
-                    'arrival_time_utc': time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(flight.lastSeen)) if flight.lastSeen else None
+                    'icao24': flight.get('icao24'),
+                    'callsign': flight.get('callsign', '').strip() if flight.get('callsign') else None,
+                    'departure_airport': flight.get('estDepartureAirport'),
+                    'arrival_airport': flight.get('estArrivalAirport'),
+                    'first_seen': flight.get('firstSeen'),
+                    'last_seen': flight.get('lastSeen'),
+                    'departure_time_utc': time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(flight.get('firstSeen'))) if flight.get('firstSeen') else None,
+                    'arrival_time_utc': time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(flight.get('lastSeen'))) if flight.get('lastSeen') else None
                 })
             
             return {
@@ -241,23 +285,30 @@ class OpenSkyService:
                 'timestamp': int(time.time())
             }
             
-            # Get current time and 2-hour window
             end_time = int(time.time())
-            begin_time = end_time - (2 * 3600)  # Last 2 hours
+            begin_time = end_time - (2 * 3600)
             
             if include_arrivals:
                 try:
-                    arrivals = self.api.get_arrivals_by_airport(airport_code, begin_time, end_time)
+                    response = requests.get(
+                        f"{self.base_url}/flights/arrival",
+                        params={'airport': airport_code, 'begin': begin_time, 'end': end_time},
+                        auth=self.auth,
+                        timeout=Config.REQUEST_TIMEOUT
+                    )
+                    response.raise_for_status()
+                    arrivals = response.json()
+                    
                     result['arrivals'] = {
                         'count': len(arrivals) if arrivals else 0,
                         'flights': [
                             {
-                                'icao24': f.icao24,
-                                'callsign': f.callsign.strip() if f.callsign else None,
-                                'departure_airport': f.estDepartureAirport,
-                                'arrival_time': time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(f.lastSeen)) if f.lastSeen else None
+                                'icao24': f.get('icao24'),
+                                'callsign': f.get('callsign', '').strip() if f.get('callsign') else None,
+                                'departure_airport': f.get('estDepartureAirport'),
+                                'arrival_time': time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(f.get('lastSeen'))) if f.get('lastSeen') else None
                             }
-                            for f in (arrivals[:10] if arrivals else [])  # Limit to 10
+                            for f in (arrivals[:10] if arrivals else [])
                         ]
                     }
                 except:
@@ -265,14 +316,34 @@ class OpenSkyService:
             
             if include_departures:
                 try:
-                    departures = self.api.get_departures_by_airport(airport_code, begin_time, end_time)
+                    response = requests.get(
+                        f"{self.base_url}/flights/departure",
+                        params={'airport': airport_code, 'begin': begin_time, 'end': end_time},
+                        auth=self.auth,
+                        timeout=Config.REQUEST_TIMEOUT
+                    )
+                    response.raise_for_status()
+                    departures = response.json()
+                    
                     result['departures'] = {
                         'count': len(departures) if departures else 0,
                         'flights': [
                             {
-                                'icao24': f.icao24,
-                                'callsign': f.callsign.strip() if f.callsign else None,
-                                'arrival_airport': f.estArrivalAirport,
-                                'departure_time': time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(f
-
-
+                                'icao24': f.get('icao24'),
+                                'callsign': f.get('callsign', '').strip() if f.get('callsign') else None,
+                                'arrival_airport': f.get('estArrivalAirport'),
+                                'departure_time': time.strftime('%Y-%m-%d %H:%M:%S', time.gmtime(f.get('firstSeen'))) if f.get('firstSeen') else None
+                            }
+                            for f in (departures[:10] if departures else [])
+                        ]
+                    }
+                except:
+                    result['departures'] = {'count': 0, 'error': 'Unable to fetch departures'}
+            
+            return result
+            
+        except Exception as e:
+            return {
+                'success': False,
+                'error': str(e)
+            }
