@@ -2,6 +2,10 @@ from mistralai import Mistral
 import requests
 import json
 import os
+from dotenv import load_dotenv
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Initialize Mistral client with your API key from environment variable
 MISTRAL_API_KEY = os.getenv('MISTRAL_API_KEY')
